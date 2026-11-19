@@ -4,6 +4,7 @@
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
+from pathlib import Path
 from queue import Empty, Full, Queue
 import subprocess
 import sys
@@ -77,7 +78,7 @@ def codex_limits():
             reader.join(timeout=1)
 
 
-def reset_line(provider, window, reset, used, now):
+def reset_line(provider, window, reset, used, now, scope=""):
     if type(reset) is not int:
         return None
     try:
@@ -88,7 +89,8 @@ def reset_line(provider, window, reset, used, now):
         return None
     timestamp = when.isoformat(timespec="seconds").replace("+00:00", "Z")
     status = "erreicht" if type(used) in (int, float) and used >= 100 else "geplant"
-    return f"{provider} | {window} | {timestamp} | {status}"
+    line = f"{provider} | {window} | {timestamp} | {status}"
+    return f"{line} | {scope}" if scope else line
 
 
 def export_lines(source, data, now):
@@ -96,22 +98,17 @@ def export_lines(source, data, now):
         return []
     if source == "codex":
         snapshots = data.get("rateLimitsByLimitId") or {}
-        main = snapshots.get("codex") or data.get("rateLimits") or {}
-        if main.get("limitId") not in (None, "codex"):
+        if not isinstance(snapshots, dict):
             return []
-        candidates = []
-        for key in ("primary", "secondary"):
-            window = main.get(key) or {}
-            duration = window.get("windowDurationMins")
-            if type(duration) is int and 0 < duration <= 10080:
-                label = "wöchentlich" if duration == 10080 else "kurzfristig" if duration <= 1440 else "unbekannt"
-                line = reset_line("Codex", label, window.get("resetsAt"), window.get("usedPercent"), now)
-                if line:
-                    candidates.append((label, line))
-        return [
-            line for label, line in candidates
-            if sum(other == label for other, _ in candidates) == 1
-        ]
+        main = snapshots.get("codex") or data.get("rateLimits") or {}
+        result = codex_window_lines(main, "", now) if main.get("limitId") in (None, "codex") else []
+        for limit_id, snapshot in sorted(snapshots.items()):
+            if limit_id == "codex" or not isinstance(snapshot, dict):
+                continue
+            scope = limit_id.strip()
+            if scope and len(scope) <= 64 and scope.isprintable() and "|" not in scope:
+                result.extend(codex_window_lines(snapshot, scope, now))
+        return result
 
     result = []
     windows = data.get("rate_limits") or {}
@@ -123,9 +120,24 @@ def export_lines(source, data, now):
     return result
 
 
+def codex_window_lines(snapshot, scope, now):
+    candidates = []
+    for key in ("primary", "secondary"):
+        window = snapshot.get(key) or {}
+        duration = window.get("windowDurationMins")
+        if type(duration) is not int or not 0 < duration <= 10080:
+            continue
+        label = "wöchentlich" if duration == 10080 else "kurzfristig" if duration <= 1440 else "unbekannt"
+        line = reset_line("Codex", label, window.get("resetsAt"), window.get("usedPercent"), now, scope)
+        if line:
+            candidates.append((label, line))
+    return [line for label, line in candidates if sum(other == label for other, _ in candidates) == 1]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", choices=("codex", "claude-status"))
+    parser.add_argument("--output", type=Path, help="Rücksetzzeiten zusätzlich als UTF-8-Datei speichern")
     args = parser.parse_args()
     try:
         data = codex_limits() if args.source == "codex" else json.load(sys.stdin)
@@ -136,7 +148,14 @@ def main():
     if not lines:
         print("Keine eindeutig zuordenbare zukünftige Rücksetzzeit vorhanden.", file=sys.stderr)
         return 1
-    print("\n".join(lines))
+    output = "\n".join(lines)
+    if args.output is not None:
+        try:
+            args.output.write_text(output + "\n", encoding="utf-8")
+        except OSError:
+            print("Exportdatei konnte nicht gespeichert werden.", file=sys.stderr)
+            return 1
+    print(output)
     return 0
 
 

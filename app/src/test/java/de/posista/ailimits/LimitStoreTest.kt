@@ -41,6 +41,56 @@ class LimitStoreTest {
         assertEquals(week.resetAt, store.dao.pending().single().resetAt)
     }
 
+    @Test fun keepsTwoWeeklyScopesAndIgnoresRelativeRepostsUntilTheReset() = runBlocking {
+        val general = week.copy(relativeFingerprint = "same-notice", scope = "Alle Modelle")
+        val fable = week.copy(resetAt = week.resetAt.plusSeconds(60), scope = "Fable")
+        store.ingest(listOf(general, fable), Source.NOTIFICATION, now)
+        val repost = general.copy(resetAt = general.resetAt.plusSeconds(30), scope = "ALLE MODELLE")
+        assertTrue(store.ingest(listOf(repost), Source.NOTIFICATION, now.plusSeconds(30)).isEmpty())
+        assertEquals(general.resetAt, store.dao.get(Provider.CLAUDE, LimitWindow.WEEKLY, "alle modelle")?.resetAt)
+        assertEquals(fable.resetAt, store.dao.get(Provider.CLAUDE, LimitWindow.WEEKLY, "fable")?.resetAt)
+        val next = general.copy(resetAt = general.resetAt.plusSeconds(86400))
+        store.ingest(listOf(next), Source.NOTIFICATION, general.resetAt.plusSeconds(5))
+        assertEquals(next.resetAt, store.dao.get(Provider.CLAUDE, LimitWindow.WEEKLY, "alle modelle")?.resetAt)
+    }
+
+    @Test fun migratesThePreviewDatabaseAndRetainsDeliveryHistory() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "preview-migration-test.db"
+        try {
+            context.openOrCreateDatabase(name, 0, null).use { legacy ->
+                legacy.execSQL("""
+                    CREATE TABLE limits (
+                        provider TEXT NOT NULL, window TEXT NOT NULL,
+                        resetMillis INTEGER NOT NULL, observedMillis INTEGER NOT NULL, source TEXT NOT NULL,
+                        reached INTEGER NOT NULL, notified INTEGER NOT NULL,
+                        PRIMARY KEY(provider, window)
+                    )
+                """.trimIndent())
+                legacy.execSQL("INSERT INTO limits VALUES ('CLAUDE', 'WEEKLY', ?, ?, 'MANUAL', 1, 1)",
+                    arrayOf(week.resetAt.toEpochMilli(), now.toEpochMilli()))
+                legacy.version = 1
+            }
+            val upgraded = Room.databaseBuilder(context, LimitDatabase::class.java, name)
+                .addMigrations(migrateLimits1To2).build()
+            try {
+                val saved = upgraded.limits().get(Provider.CLAUDE, LimitWindow.WEEKLY)!!
+                assertEquals(week.resetAt, saved.resetAt)
+                assertEquals(now, saved.observedAt)
+                assertEquals(Source.MANUAL, saved.source)
+                assertEquals("", saved.scope)
+                assertTrue(saved.reached)
+                assertTrue(saved.notified)
+                assertTrue(upgraded.limits().pending().isEmpty())
+            } finally {
+                upgraded.close()
+            }
+        } finally {
+            context.deleteDatabase(name)
+        }
+        Unit
+    }
+
     @Test fun recoversPendingResetWhenDatabaseReopens() = runBlocking {
         val context = RuntimeEnvironment.getApplication()
         val name = "limit-persistence-test.db"

@@ -27,6 +27,17 @@ class ExportTests(unittest.TestCase):
         }}
         self.assertEqual(export_lines("codex", data, self.now), [])
 
+    def test_codex_exports_named_weekly_limits_separately(self):
+        week = {"windowDurationMins": 10080, "resetsAt": self.soon}
+        data = {"rateLimitsByLimitId": {
+            "codex": {"limitId": "codex", "primary": week},
+            "other-scope": {"limitId": "other-scope", "primary": week},
+        }}
+        self.assertEqual(export_lines("codex", data, self.now), [
+            "Codex | wöchentlich | 2026-03-27T11:00:00Z | geplant",
+            "Codex | wöchentlich | 2026-03-27T11:00:00Z | geplant | other-scope",
+        ])
+
     def test_claude_ignores_expired_and_non_subscription_windows(self):
         data = {"rate_limits": {
             "five_hour": {"resets_at": self.soon - 3601},

@@ -29,7 +29,7 @@ class ResetParserTest {
         val result = ResetParser.readNotification(
             "Your 5-hour limit reached — resets in 2 hours and 15 minutes", Provider.CLAUDE, posted, now
         )
-        assertEquals(ResetCandidate(Provider.CLAUDE, LimitWindow.SHORT, now.plusSeconds(105 * 60), true), result)
+        assertEquals(ResetCandidate(Provider.CLAUDE, LimitWindow.SHORT, now.plusSeconds(105 * 60), true), result?.copy(relativeFingerprint = null))
     }
 
     @Test fun recognizesExplicitLimitWithinProviderFamily() {
@@ -87,6 +87,55 @@ class ResetParserTest {
         assertEquals(Instant.parse("2026-10-25T01:30:00Z"),
             ResetParser.parseManual("2026-10-25T02:30+01:00", berlin))
         assertEquals(Instant.parse("2026-03-29T01:30:00Z"), ResetParser.parseManual("2026-03-29 03:30", berlin))
+    }
+
+    @Test fun parsesCompleteDurationAndRejectsAlternatives() {
+        val input = "Weekly usage limit reached. Resets in 2 hours, 15 minutes"
+        val first = ResetParser.readNotification(input, Provider.CLAUDE, now, now)!!
+        assertEquals(now.plusSeconds(135 * 60), first.resetAt)
+        val repost = ResetParser.readNotification(input, Provider.CLAUDE, now.plusSeconds(60), now.plusSeconds(60))!!
+        assertEquals(first.relativeFingerprint, repost.relativeFingerprint)
+        assertTrue(first.relativeFingerprint!!.length == 64)
+        assertNull(ResetParser.readNotification(
+            "Weekly usage limit resets in 2 hours or tomorrow", Provider.CLAUDE, now, now
+        ))
+        assertNull(ResetParser.readNotification(
+            "Weekly usage limit resets in 2 hours, 15 seconds", Provider.CLAUDE, now, now
+        ))
+    }
+
+    @Test fun givesExplicitZonePriorityOverDeviceZone() {
+        val message = "Claude weekly usage limit resets at 2026-03-28 18:00 UTC"
+        val reset = Instant.parse("2026-03-28T18:00:00Z")
+        assertEquals(reset, ResetParser.readShared(message, null, now, berlin).single().resetAt)
+        assertEquals(reset, ResetParser.readNotification(message, Provider.CLAUDE, now, now)?.resetAt)
+        assertEquals(Instant.parse("2026-03-28T16:00:00Z"), ResetParser.readShared(
+            message.replace("UTC", "+02:00"), null, now, berlin
+        ).single().resetAt)
+        assertTrue(ResetParser.readShared(message.replace("UTC", "PST"), null, now, berlin).isEmpty())
+    }
+
+    @Test fun understandsGermanMeldungAndProposesOnlyTheTimeForAnUndatedNotice() {
+        val german = "Wöchentliches Nutzungslimit erreicht. Es wird am 28.03.2026 um 18:00 zurückgesetzt."
+        assertEquals(Instant.parse("2026-03-28T17:00:00Z"),
+            ResetParser.readShared(german, Provider.CLAUDE, now, berlin).single().resetAt)
+        val text = "Usage limit reached · limit resets 3:45pm (Europe/London)"
+        assertTrue(ResetParser.readShared(text, Provider.CLAUDE_CODE, now, berlin).isEmpty())
+        val draft = ResetParser.readUndated(text, Provider.CLAUDE_CODE, berlin)!!
+        assertEquals(java.time.LocalTime.of(15, 45), draft.time)
+        assertEquals(ZoneId.of("Europe/London"), draft.zone)
+        assertTrue(draft.reached)
+    }
+
+    @Test fun roundTripsNamedWindowsThroughResetFile() {
+        val original = listOf(
+            ResetCandidate(Provider.CLAUDE, LimitWindow.WEEKLY, now.plusSeconds(1800), scope = "Alle Modelle"),
+            ResetCandidate(Provider.CLAUDE, LimitWindow.WEEKLY, now.plusSeconds(3600), true, "Fable")
+        )
+        val file = java.io.ByteArrayOutputStream()
+        writeResetFile(file, original)
+        val restored = ResetParser.readShared(readResetFile(file.toByteArray().inputStream()), null, now, berlin)
+        assertEquals(original, restored)
     }
 
     @Test fun computesCountdownFromInstantsAcrossDst() {

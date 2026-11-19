@@ -1,11 +1,17 @@
 package de.posista.ailimits
 
+import java.security.MessageDigest
+import java.text.Normalizer
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.LocalDateTime
+import java.time.LocalTime
 import java.time.OffsetDateTime
 import java.time.ZoneId
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import java.time.format.ResolverStyle
 import java.util.Locale
 
 enum class Provider(val title: String) {
@@ -26,7 +32,7 @@ enum class LimitWindow(val title: String) {
 
 enum class Source(val title: String, val confidence: String) {
     NOTIFICATION("Android-Mitteilung des Anbieters", "Mittel · automatisch erkannt"),
-    SHARED("Übernommener Text", "Mittel · von dir geprüft"),
+    SHARED("Übernommener Text oder Datei", "Mittel · von dir geprüft"),
     MANUAL("Manuelle Eingabe", "Abhängig von deiner Eingabe")
 }
 
@@ -34,75 +40,133 @@ data class ResetCandidate(
     val provider: Provider,
     val window: LimitWindow,
     val resetAt: Instant,
-    val reached: Boolean = false
+    val reached: Boolean = false,
+    val scope: String = "",
+    val relativeFingerprint: String? = null
 )
+
+data class UndatedReset(
+    val provider: Provider,
+    val window: LimitWindow,
+    val time: LocalTime,
+    val zone: ZoneId,
+    val reached: Boolean,
+    val scope: String
+)
+
+internal fun scopeId(scope: String): String =
+    Normalizer.normalize(scope.trim(), Normalizer.Form.NFC).lowercase(Locale.ROOT)
 
 object ResetParser {
     const val MAX_INPUT = 4096
+    const val MAX_FILE_INPUT = 65_536
+    const val MAX_SCOPE_LENGTH = 64
 
     private val product = Regex("""\b(?:Claude Code|ChatGPT|Codex|Claude)\b""", RegexOption.IGNORE_CASE)
     private val limit = Regex(
         """\b(?:limits?|nutzungslimits?|wochenlimit|sitzungslimit|kontingent|usage cap|rate limit)\b""", RegexOption.IGNORE_CASE
     )
     private val reset = Regex(
-        """\b(?:resets?\s+(?:at|on|in)|try again\s+(?:at|on|in)|resets?\s*(?=\d)|(?:erneut|wieder)\s+(?:ab|um|in|am)|(?:reset|zurückgesetzt)\s+(?:ab|um|in|am))\b""",
+        """\b(?:resets?\s+(?:at|on|in)\s+|try again\s+(?:at|on|in)\s+|resets?\s+(?=\d)|(?:erneut|wieder)\s+(?:ab|um|in|am)\s+|(?:reset|zurückgesetzt)\s+(?:ab|um|in|am)\s+|wird\s+(?:am\s+)?(?=\d{2}\.\d{2}\.\d{4}\b[^\n]*\bzurückgesetzt\b))""",
         RegexOption.IGNORE_CASE
     )
-    private val apiContext = Regex("""\b(?:api[- ](?:usage|rate|key|token|limit)|(?:requests|tokens) per minute)\b""", RegexOption.IGNORE_CASE)
+    private val apiContext = Regex(
+        """\b(?:api[- ](?:usage|rate|key|token|limit)|(?:requests|tokens) per minute)\b""", RegexOption.IGNORE_CASE
+    )
     private val reached = Regex(
         """\b(?:reached|hit|exceeded) (?:\w+ ){0,4}limits?\b|\blimits? (?:reached|exceeded)\b|\b(?:limit|nutzungslimit|kontingent) (?:ist )?(?:erreicht|aufgebraucht)\b""",
         RegexOption.IGNORE_CASE
     )
     private val weekly = Regex("""\b(?:weekly|wöchentlich\p{L}*|wochenlimit|7[ -]?day)\b""")
-    private val short = Regex("""\b(?:session|kurzfristig\p{L}*|sitzungslimit|(?:\d+)[ -]?(?:hour|stunden))\b""")
-    private val offsetTimestamp = Regex(
-        """\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d(?:\.\d{1,9})?)?(?:Z|[+-]\d\d:\d\d)(?![\w:+-])"""
+    private val short = Regex("""\b(?:session|kurzfristig\p{L}*|sitzungslimit|\d+[ -]?(?:hour|stunden))\b""")
+    private val modelScope = Regex("""\b(?:fable|opus|sonnet|haiku)\b""")
+    private val allModels = Regex("""\b(?:all models|alle modelle)\b""")
+    private val dateTime = Regex(
+        """^(?:(\d{4}-\d\d-\d\d)[T ]|(\d\d\.\d\d\.\d{4}),?\s+(?:um\s+)?)(\d\d:\d\d(?::\d\d(?:\.\d{1,9})?)?)(?![\d:])"""
     )
-    private val localTimestamp = Regex(
-        """^(?:(\d{4}-\d\d-\d\d)[T ]|(\d\d\.\d\d\.\d{4}),?\s+)(\d\d:\d\d)(?![\w:+-]|\s*[+-]\d)(?:\s*\(([^)]+)\))?"""
+    private val clockTime = Regex("""^(\d{1,2})(?::(\d\d))?(?:\s*(am|pm)\b)?(?![\d:.])""", RegexOption.IGNORE_CASE)
+    private val zoneToken = Regex(
+        """^((?i:(?:UTC|GMT)[+-]\d{2}:?\d{2}|UTC|GMT|Z|PST|PDT|EST|EDT|CST|CDT|MST|MDT|CET|CEST|MEZ|MESZ|BST|IST)|[+-]\d{2}:?\d{2}|[A-Za-z][\w+.-]*(?:/[\w+.-]+)+|[A-Z][A-Z0-9]{0,4})(?![\w/:+-])"""
     )
-    private val relative = Regex(
-        """(?i)^\s*(?:(\d{1,3})\s*(?:hours?|hrs?|h|stunden?|std\.?)(?![\p{L}\d]))?\s*(?:and\s+|und\s+)?(?:(\d{1,3})\s*(?:minutes?|mins?|m|minuten?)(?![\p{L}\d]))?"""
-    )
+    private val hours = Regex("""^(\d{1,3})\s*(?:hours?|hrs?|stunden?|std\.?|h)\b""", RegexOption.IGNORE_CASE)
+    private val minutes = Regex("""^(\d{1,3})\s*(?:minutes?|mins?|minuten?|m)\b""", RegexOption.IGNORE_CASE)
+    private val durationSeparator = Regex("""^\s*,?\s*(?:(?:and|und)\b\s*)?""", RegexOption.IGNORE_CASE)
+    private val ambiguousDurationTail = Regex("""^[\s,;:/–—-]*(?:\d|and\b|or\b|und\b|oder\b)""", RegexOption.IGNORE_CASE)
+    private val germanDate = DateTimeFormatter.ofPattern("dd.MM.uuuu").withResolverStyle(ResolverStyle.STRICT)
+    private val manualDateTime = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm").withResolverStyle(ResolverStyle.STRICT)
 
     fun readShared(text: String, fallback: Provider?, now: Instant, zone: ZoneId): List<ResetCandidate> {
-        val input = text.take(MAX_INPUT)
+        val input = text.take(MAX_FILE_INPUT)
         val lines = input.lineSequence().mapNotNull { line ->
-            parseStructured(line) ?: parseNotice(line, fallback, now, zone, null)
+            parseStructured(line) ?: parseNotice(line, fallback, zone, null)
         }.filter { isFuture(it.resetAt, now) }.toList()
         val candidates = lines.ifEmpty {
-            listOfNotNull(parseNotice(input, fallback, now, zone, null))
-                .filter { isFuture(it.resetAt, now) }
+            listOfNotNull(parseNotice(input, fallback, zone, null)).filter { isFuture(it.resetAt, now) }
         }
-        return candidates.groupBy { it.provider to it.window }.values.mapNotNull { options ->
+        return candidates.groupBy { Triple(it.provider, it.window, scopeId(it.scope)) }.values.mapNotNull { options ->
             val first = options.first()
             first.takeIf { options.all { item -> item.resetAt == first.resetAt } }
         }
     }
 
-    fun readNotification(
-        text: String, provider: Provider, postedAt: Instant, now: Instant
-    ): ResetCandidate? =
-        parseNotice(text.take(MAX_INPUT), provider, now, null, postedAt)
+    fun readNotification(text: String, provider: Provider, postedAt: Instant, now: Instant): ResetCandidate? {
+        if (postedAt > now) return null
+        return parseNotice(text.take(MAX_INPUT), provider, null, postedAt)
             ?.takeIf { isFuture(it.resetAt, now) && (it.provider == provider ||
                 provider == Provider.CHATGPT && it.provider == Provider.CODEX ||
                 provider == Provider.CLAUDE && it.provider == Provider.CLAUDE_CODE) }
+    }
+
+    fun readUndated(text: String, fallback: Provider?, defaultZone: ZoneId): UndatedReset? {
+        val notice = notice(text.take(MAX_INPUT), fallback) ?: return null
+        if (notice.relative) return null
+        val time = clockTime.find(notice.timeText) ?: return null
+        val (_, hourText, minuteText, period) = time.groupValues
+        if (minuteText.isEmpty() && period.isEmpty()) return null
+        val hour = hourText.toInt()
+        val adjustedHour = when {
+            period.isEmpty() -> hour
+            hour !in 1..12 -> return null
+            period.equals("pm", true) -> hour % 12 + 12
+            else -> hour % 12
+        }
+        val tail = notice.timeText.substring(time.range.last + 1).trimStart()
+        // A malformed or unfinished date must be corrected in the original input.
+        if (tail.firstOrNull()?.let { it.isDigit() || it == ':' } == true) return null
+        val zone = resolveZone(tail, defaultZone) ?: return null
+        val localTime = runCatching { LocalTime.of(adjustedHour, minuteText.toIntOrNull() ?: 0) }.getOrNull()
+            ?: return null
+        return UndatedReset(notice.provider, notice.window, localTime, zone, notice.reached, notice.scope)
+    }
+
+    fun resolveLocal(value: LocalDateTime, zone: ZoneId): Instant? =
+        zone.rules.getValidOffsets(value).singleOrNull()?.let(value::toInstant)
 
     fun parseManual(input: String, zone: ZoneId): Instant? {
         val value = input.trim()
-        return parseOffset(value) ?: runCatching {
-            val dateTime = LocalDateTime.parse(value, DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm")
-                .withResolverStyle(java.time.format.ResolverStyle.STRICT))
-            val offset = zone.rules.getValidOffsets(dateTime).single()
-            dateTime.toInstant(offset)
-        }.getOrNull()
+        return parseOffset(value) ?: runCatching { LocalDateTime.parse(value, manualDateTime) }.getOrNull()
+            ?.let { resolveLocal(it, zone) }
     }
 
     fun isFuture(resetAt: Instant, now: Instant) = resetAt > now && resetAt <= now.plus(Duration.ofDays(30))
 
+    fun validScope(scope: String) = scope.length <= MAX_SCOPE_LENGTH &&
+        scope.none { it == '|' || it.isISOControl() }
+
+    fun formatLine(candidate: ResetCandidate): String {
+        val window = when (candidate.window) {
+            LimitWindow.SHORT -> "kurzfristig"
+            LimitWindow.WEEKLY -> "wöchentlich"
+            LimitWindow.UNKNOWN -> "unbekannt"
+        }
+        val state = if (candidate.reached) "erreicht" else "geplant"
+        return "${candidate.provider.title} | $window | ${candidate.resetAt} | $state" +
+            candidate.scope.trim().takeIf(String::isNotEmpty)?.let { " | $it" }.orEmpty()
+    }
+
     private fun parseStructured(line: String): ResetCandidate? {
         val parts = line.split('|').map(String::trim)
-        if (parts.size !in 3..4) return null
+        if (parts.size !in 3..5) return null
         val provider = Provider.entries.singleOrNull { it.title.equals(parts[0], true) } ?: return null
         val window = when (parts[1].lowercase(Locale.ROOT)) {
             "kurzfristig", "short", "session" -> LimitWindow.SHORT
@@ -115,20 +179,25 @@ object ResetParser {
             "erreicht", "reached" -> true
             else -> return null
         }
-        return ResetCandidate(provider, window, parseOffset(parts[2]) ?: return null, hit)
+        val scope = parts.getOrNull(4).orEmpty()
+        if (!validScope(scope)) return null
+        return ResetCandidate(provider, window, parseOffset(parts[2]) ?: return null, hit, scope)
     }
 
-    private fun parseNotice(
-        message: String, fallback: Provider?, now: Instant, zone: ZoneId?, postedAt: Instant?
-    ): ResetCandidate? {
+    private data class Notice(
+        val provider: Provider, val window: LimitWindow, val scope: String,
+        val reached: Boolean, val timeText: String, val relative: Boolean
+    )
+
+    private fun notice(message: String, fallback: Provider?): Notice? {
         if (!limit.containsMatchIn(message) || apiContext.containsMatchIn(message)) return null
         val marker = reset.findAll(message).singleOrNull() ?: return null
         val declared = product.findAll(message).map { match ->
             Provider.entries.first { it.title.equals(match.value, true) }
         }.distinct().toList()
-        val provider = when {
-            declared.isEmpty() -> fallback
-            declared.size == 1 -> declared.first()
+        val provider = when (declared.size) {
+            0 -> fallback
+            1 -> declared.first()
             else -> null
         } ?: return null
         val context = message.take(marker.range.first).lowercase(Locale.ROOT)
@@ -138,31 +207,77 @@ object ResetParser {
             short.containsMatchIn(context) -> LimitWindow.SHORT
             else -> LimitWindow.UNKNOWN
         }
+        val scope = if (provider == Provider.CLAUDE || provider == Provider.CLAUDE_CODE) {
+            when {
+                allModels.containsMatchIn(context) -> "Alle Modelle"
+                else -> modelScope.findAll(context).map { it.value }.distinct().singleOrNull()
+                    ?.replaceFirstChar { it.titlecase(Locale.ROOT) }.orEmpty()
+            }
+        } else ""
         val timeText = message.substring(marker.range.last + 1).trimStart()
-        val exact = offsetTimestamp.find(timeText)?.takeIf { it.range.first == 0 }
-            ?.let { parseOffset(it.value) }
-        val local = localTimestamp.find(timeText)?.let { timestamp ->
-            val (_, isoDay, germanDay, clock, zoneId) = timestamp.groupValues
-            val date = isoDay.ifEmpty { germanDay.split('.').asReversed().joinToString("-") }
-            val explicitZone = zoneId.takeIf { '/' in it || it == "UTC" }
-                ?.let { runCatching { ZoneId.of(it) }.getOrNull() }
-            val resolvedZone = if (zoneId.isEmpty()) zone else explicitZone
-            resolvedZone?.let { parseManual("$date $clock", it) }
-        }
-        val until = exact ?: local ?: if (postedAt != null && postedAt <= now &&
-            marker.value.endsWith(" in", ignoreCase = true)
-        ) parseRelative(timeText, postedAt) else null
-        return ResetCandidate(provider, window, until ?: return null, reached.containsMatchIn(message))
+        val relative = marker.value.trimEnd().endsWith(" in", ignoreCase = true)
+        return Notice(provider, window, scope, reached.containsMatchIn(message), timeText, relative)
     }
 
-    private fun parseRelative(text: String, postedAt: Instant): Instant? {
-        val match = relative.find(text) ?: return null
-        val hours = match.groupValues[1].toLongOrNull() ?: 0
-        val minutes = match.groupValues[2].toLongOrNull() ?: 0
-        val tail = text.substring(match.range.last + 1).trimStart()
-        val total = hours * 60 + minutes
-        if (total == 0L || tail.firstOrNull()?.isDigit() == true) return null
-        return postedAt.plusSeconds(total * 60)
+    private fun parseNotice(message: String, fallback: Provider?, zone: ZoneId?, postedAt: Instant?): ResetCandidate? {
+        val notice = notice(message, fallback) ?: return null
+        val exact = parseDated(notice.timeText, zone)
+        if (exact != null) {
+            return ResetCandidate(notice.provider, notice.window, exact, notice.reached, notice.scope)
+        }
+        if (postedAt == null || !notice.relative) return null
+        val delay = parseRelative(notice.timeText) ?: return null
+        val normalized = message.lowercase(Locale.ROOT).trim().replace(Regex("""\s+"""), " ")
+        val fingerprint = MessageDigest.getInstance("SHA-256").digest(normalized.toByteArray())
+            .joinToString("") { "%02x".format(Locale.ROOT, it.toInt() and 0xff) }
+        return ResetCandidate(notice.provider, notice.window, postedAt.plus(delay), notice.reached, notice.scope, fingerprint)
+    }
+
+    private fun parseDated(input: String, fallback: ZoneId?): Instant? {
+        val match = dateTime.find(input) ?: return null
+        val (_, isoDate, german, clock) = match.groupValues
+        val zone = resolveZone(input.substring(match.range.last + 1), fallback) ?: return null
+        return runCatching {
+            val date = if (isoDate.isEmpty()) LocalDate.parse(german, germanDate) else LocalDate.parse(isoDate)
+            resolveLocal(date.atTime(LocalTime.parse(clock)), zone)
+        }.getOrNull()
+    }
+
+    private fun resolveZone(suffix: String, fallback: ZoneId?): ZoneId? {
+        val tail = suffix.trimStart()
+        if (tail.startsWith('(')) {
+            val end = tail.indexOf(')')
+            if (end < 0) return null
+            return parseZoneToken(tail.substring(1, end).trim())
+        }
+        val token = zoneToken.find(tail)?.value
+        if (token != null) return parseZoneToken(token)
+        if (tail.startsWith('+') || tail.startsWith('-') ||
+            tail.startsWith("UTC+", true) || tail.startsWith("UTC-", true) ||
+            tail.startsWith("GMT+", true) || tail.startsWith("GMT-", true)
+        ) return null
+        return fallback
+    }
+
+    private fun parseZoneToken(token: String): ZoneId? = runCatching {
+        when {
+            token.equals("Z", true) || token.equals("UTC", true) || token.equals("GMT", true) -> ZoneOffset.UTC
+            token.startsWith("UTC", true) || token.startsWith("GMT", true) -> ZoneId.of(token.uppercase(Locale.ROOT))
+            token.startsWith('+') || token.startsWith('-') -> ZoneOffset.of(token)
+            '/' in token -> ZoneId.of(token)
+            else -> null
+        }
+    }.getOrNull()
+
+    private fun parseRelative(text: String): Duration? {
+        val hourMatch = hours.find(text)
+        val remainder = if (hourMatch == null) text else text.substring(hourMatch.range.last + 1)
+        val separator = if (hourMatch == null) "" else durationSeparator.find(remainder)?.value.orEmpty()
+        val minuteMatch = minutes.find(remainder.substring(separator.length))
+        val tail = if (minuteMatch == null) remainder else remainder.substring(separator.length + minuteMatch.range.last + 1)
+        val total = (hourMatch?.groupValues?.get(1)?.toLong() ?: 0) * 60 +
+            (minuteMatch?.groupValues?.get(1)?.toLong() ?: 0)
+        return if (total == 0L || ambiguousDurationTail.containsMatchIn(tail)) null else Duration.ofMinutes(total)
     }
 
     private fun parseOffset(value: String): Instant? =

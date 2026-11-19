@@ -9,6 +9,7 @@ import android.content.Intent
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.room.Room
+import androidx.work.Configuration
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
@@ -25,9 +26,12 @@ import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.TimeUnit
 
-class LimitApplication : Application() {
+class LimitApplication : Application(), Configuration.Provider {
+    override val workManagerConfiguration = Configuration.Builder().build()
+
     private val database by lazy {
-        Room.databaseBuilder(this, LimitDatabase::class.java, "limits.db").build()
+        Room.databaseBuilder(this, LimitDatabase::class.java, "limits.db")
+            .addMigrations(migrateLimits1To2).build()
     }
     val store by lazy { LimitStore(database) }
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -56,7 +60,7 @@ class LimitApplication : Application() {
         }
 
     suspend fun delete(record: LimitRecord) = mutex.withLock {
-        store.dao.delete(record.provider, record.window)
+        store.dao.delete(record.provider, record.window, record.scopeId)
         work.cancelUniqueWork("reset-${record.key}")
         manager.cancel(record.key, NOTIFICATION_ID)
     }
@@ -75,8 +79,7 @@ class LimitApplication : Application() {
             OneTimeWorkRequestBuilder<ResetWorker>().setInitialDelay(delay, TimeUnit.MILLISECONDS).build())
     }
 
-    suspend fun notifyDue() = mutex.withLock {
-        val now = Instant.now()
+    suspend fun notifyDue(now: Instant = Instant.now()) = mutex.withLock {
         for (record in store.dao.pending()) {
             if (record.resetAt > now) continue
             if (Duration.between(record.resetAt, now) >= Duration.ofHours(24)) {
@@ -89,25 +92,37 @@ class LimitApplication : Application() {
                 LimitWindow.WEEKLY -> "Das wöchentliche Nutzungslimit sollte jetzt zurückgesetzt sein."
                 LimitWindow.UNKNOWN -> "Das erfasste Nutzungslimit sollte jetzt zurückgesetzt sein."
             }
-            val pendingIntent = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-            val notification = NotificationCompat.Builder(this, CHANNEL)
-                .setSmallIcon(R.drawable.ic_reminder)
-                .setContentTitle("${record.provider.title} · Limit-Reset")
-                .setContentText(content)
-                .setStyle(NotificationCompat.BigTextStyle().bigText(content))
-                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-                .setOnlyAlertOnce(true)
-                .setAutoCancel(true)
-                .setContentIntent(pendingIntent)
-                .build()
-            // The user can revoke permission between the check and the framework call.
-            try {
-                manager.notify(record.key, NOTIFICATION_ID, notification)
+            val title = listOf(record.provider.title, record.scope, "Limit-Reset")
+                .filter(String::isNotBlank).joinToString(" · ")
+            if (post(record.key, title, content)) {
                 store.dao.save(record.copy(notified = true))
-            } catch (_: SecurityException) {
-                continue
             }
+        }
+    }
+
+    fun showTestNotification(): Boolean = post(
+        "test-reminder", "AI Limit Notifier", "Deine Reset-Erinnerungen sind eingerichtet."
+    )
+
+    private fun post(tag: String, title: String, content: String): Boolean {
+        if (!canNotify()) return false
+        val pendingIntent = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val notification = NotificationCompat.Builder(this, CHANNEL)
+            .setSmallIcon(R.drawable.ic_reminder)
+            .setContentTitle(title)
+            .setContentText(content)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(content))
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setOnlyAlertOnce(true)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+        return try {
+            manager.notify(tag, NOTIFICATION_ID, notification)
+            true
+        } catch (_: SecurityException) {
+            false
         }
     }
 

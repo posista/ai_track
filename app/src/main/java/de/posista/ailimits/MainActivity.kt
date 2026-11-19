@@ -55,8 +55,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.app.NotificationManagerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -166,6 +169,43 @@ private fun Dashboard(
     var importText by remember { mutableStateOf<String?>(null) }
     var manual by remember { mutableStateOf<ManualEntry?>(null) }
     var delete by remember { mutableStateOf<LimitRecord?>(null) }
+    var feedback by remember { mutableStateOf<String?>(null) }
+    val resolver = LocalContext.current.contentResolver
+    val importFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) scope.launch {
+            try {
+                val input = withContext(Dispatchers.IO) {
+                    readResetFile(resolver.openInputStream(uri) ?: throw IOException())
+                }
+                importText = input
+                feedback = null
+            } catch (_: IOException) {
+                feedback = "Die Datei konnte nicht geöffnet werden."
+            } catch (_: IllegalArgumentException) {
+                feedback = "Die Datei ist zu groß oder hat ein ungültiges Format."
+            } catch (_: SecurityException) {
+                feedback = "Android hat den Zugriff auf die Datei verweigert."
+            }
+        }
+    }
+    val exportFile = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+        if (uri != null) scope.launch {
+            val active = records.map(LimitRecord::asCandidate)
+                .filter { ResetParser.isFuture(it.resetAt, Instant.now()) }
+            try {
+                withContext(Dispatchers.IO) {
+                    resolver.openOutputStream(uri)?.use { writeResetFile(it, active) } ?: throw IOException()
+                }
+                feedback = "${active.size} Rücksetzzeiten exportiert."
+            } catch (_: IOException) {
+                feedback = "Die Datei konnte nicht gespeichert werden."
+            } catch (_: IllegalArgumentException) {
+                feedback = "Der Export überschreitet die maximale Dateigröße."
+            } catch (_: SecurityException) {
+                feedback = "Android hat den Zugriff auf die Datei verweigert."
+            }
+        }
+    }
     LaunchedEffect(sharedText) {
         if (sharedText != null) {
             importText = sharedText
@@ -202,6 +242,18 @@ private fun Dashboard(
                         Text("Zeit eintragen")
                     }
                 }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = { importFile.launch(arrayOf("text/plain", "application/octet-stream")) },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("Datei öffnen") }
+                    OutlinedButton(
+                        onClick = { exportFile.launch("ai-limit-notifier.txt") },
+                        enabled = records.any { ResetParser.isFuture(it.resetAt, now) },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("Zeiten exportieren") }
+                }
+                feedback?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
                 Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
                     Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text("Android-Benachrichtigungen", style = MaterialTheme.typography.titleMedium)
@@ -221,6 +273,11 @@ private fun Dashboard(
                         )
                         if (!notificationsEnabled) {
                             TextButton(onClick = onEnableReminders) { Text("Erinnerungen erlauben") }
+                        } else {
+                            TextButton(onClick = {
+                                feedback = if (app.showTestNotification()) "Test-Erinnerung gesendet."
+                                else "Android blockiert die Test-Erinnerung."
+                            }) { Text("Test-Erinnerung senden") }
                         }
                     }
                 }
@@ -228,7 +285,7 @@ private fun Dashboard(
                 for (provider in Provider.entries) {
                     ProviderCard(
                         provider, records.filter { it.provider == provider }, now, zone,
-                        onEdit = { window -> manual = ManualEntry(provider, window) },
+                        onEdit = { window, record -> manual = ManualEntry(provider, window, existing = record) },
                         onDelete = { delete = it }
                     )
                 }
@@ -236,20 +293,32 @@ private fun Dashboard(
         }
     }
     importText?.let { text ->
-        ImportDialog(text, zone, onClose = { importText = null }, onSave = { candidates ->
-            scope.launch { app.save(candidates, Source.SHARED, Instant.now()); importText = null }
+        ImportDialog(text, zone, onClose = { importText = null }, onCompleteDate = { draft ->
+            importText = null
+            manual = ManualEntry(draft.provider, draft.window, undated = draft)
+        }, onSave = { candidates ->
+            scope.launch {
+                val count = app.save(candidates, Source.SHARED, Instant.now())
+                feedback = "$count Rücksetzzeiten übernommen."
+                importText = null
+            }
         })
     }
     manual?.let { initial ->
         ManualDialog(initial, zone, onClose = { manual = null }, onSave = { candidate ->
-            scope.launch { app.save(listOf(candidate), Source.MANUAL, Instant.now()); manual = null }
+            scope.launch {
+                val source = if (initial.undated == null) Source.MANUAL else Source.SHARED
+                app.save(listOf(candidate), source, Instant.now())
+                manual = null
+            }
         })
     }
     delete?.let { record ->
         AlertDialog(
             onDismissRequest = { delete = null },
             title = { Text("Rücksetzzeit entfernen?") },
-            text = { Text("${record.provider.title} · ${record.window.title}") },
+            text = { Text(listOf(record.provider.title, record.window.title, record.scope)
+                .filter(String::isNotBlank).joinToString(" · ")) },
             confirmButton = {
                 TextButton(onClick = {
                     scope.launch { app.delete(record); delete = null }
@@ -263,7 +332,7 @@ private fun Dashboard(
 @Composable
 private fun ProviderCard(
     provider: Provider, records: List<LimitRecord>, now: Instant, zone: ZoneId,
-    onEdit: (LimitWindow) -> Unit, onDelete: (LimitRecord) -> Unit
+    onEdit: (LimitWindow, LimitRecord?) -> Unit, onDelete: (LimitRecord) -> Unit
 ) {
     Card(
         shape = RoundedCornerShape(22.dp),
@@ -275,38 +344,44 @@ private fun ProviderCard(
                 window != LimitWindow.UNKNOWN || records.any { it.window == window }
             }
             for (window in windows) {
-                HorizontalDivider()
-                val record = records.firstOrNull { it.window == window }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(window.title, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
-                    Surface(
-                        shape = RoundedCornerShape(10.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant
-                    ) {
-                        Text(record?.let { remainingTime(it.resetAt, now) } ?: "Unbekannt",
-                            Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                            style = MaterialTheme.typography.labelLarge)
+                val matches = records.filter { it.window == window }.sortedBy(LimitRecord::scopeId)
+                val entries: List<LimitRecord?> = matches.ifEmpty { listOf(null) }
+                for (record in entries) {
+                    HorizontalDivider()
+                    val label = listOf(window.title, record?.scope.orEmpty())
+                        .filter(String::isNotBlank).joinToString(" · ")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant
+                        ) {
+                            Text(record?.let { remainingTime(it.resetAt, now) } ?: "Unbekannt",
+                                Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                style = MaterialTheme.typography.labelLarge)
+                        }
+                    }
+                    if (record != null) {
+                        val status = when {
+                            record.resetAt <= now -> "Reset fällig · Verfügbarkeit unbestätigt"
+                            record.reached -> "Limit laut Quelle erreicht"
+                            else -> "Reset erfasst · Limitstatus unbekannt"
+                        }
+                        Detail(status)
+                        Detail("Reset ${displayTime(record.resetAt, zone)}")
+                        Detail("Aktualisiert ${displayTime(record.observedAt, zone)}")
+                        Detail("Quelle · ${record.source.title}")
+                        Detail("Zuverlässigkeit · ${record.source.confidence}")
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        TextButton(onClick = { onEdit(window, record) }) {
+                            Text(if (record == null) "Rücksetzzeit eintragen" else "Bearbeiten")
+                        }
+                        if (record != null) TextButton(onClick = { onDelete(record) }) { Text("Entfernen") }
                     }
                 }
-                if (record == null) {
-                    Detail("Status, Quelle und Zuverlässigkeit unbekannt · keine Aktualisierung")
-                } else {
-                    val status = when {
-                        record.resetAt <= now -> "Reset fällig · Verfügbarkeit unbestätigt"
-                        record.reached -> "Limit laut Quelle erreicht"
-                        else -> "Reset erfasst · Limitstatus unbekannt"
-                    }
-                    Detail(status)
-                    Detail("Reset ${displayTime(record.resetAt, zone)}")
-                    Detail("Aktualisiert ${displayTime(record.observedAt, zone)}")
-                    Detail("Quelle · ${record.source.title}")
-                    Detail("Zuverlässigkeit · ${record.source.confidence}")
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    TextButton(onClick = { onEdit(window) }) {
-                        Text(if (record == null) "Rücksetzzeit eintragen" else "Bearbeiten")
-                    }
-                    if (record != null) TextButton(onClick = { onDelete(record) }) { Text("Entfernen") }
+                if (matches.isNotEmpty()) {
+                    TextButton(onClick = { onEdit(window, null) }) { Text("Kontingent hinzufügen") }
                 }
             }
         }
@@ -319,10 +394,16 @@ private fun Detail(text: String) {
 }
 
 @Composable
-private fun ImportDialog(initial: String, zone: ZoneId, onClose: () -> Unit, onSave: (List<ResetCandidate>) -> Unit) {
+private fun ImportDialog(
+    initial: String, zone: ZoneId, onClose: () -> Unit,
+    onCompleteDate: (UndatedReset) -> Unit, onSave: (List<ResetCandidate>) -> Unit
+) {
     var text by remember(initial) { mutableStateOf(initial) }
     var provider by remember { mutableStateOf<Provider?>(null) }
     val parsed = remember(text, provider, zone) { ResetParser.readShared(text, provider, Instant.now(), zone) }
+    val undated = remember(text, provider, zone) {
+        if (parsed.isEmpty()) ResetParser.readUndated(text, provider, zone) else null
+    }
     AlertDialog(
         onDismissRequest = onClose,
         title = { Text("Reset aus Text übernehmen") },
@@ -330,18 +411,23 @@ private fun ImportDialog(initial: String, zone: ZoneId, onClose: () -> Unit, onS
             Column(Modifier.imePadding().verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
-                    value = text, onValueChange = { text = it.take(ResetParser.MAX_INPUT) },
+                    value = text, onValueChange = { text = it.take(ResetParser.MAX_FILE_INPUT) },
                     modifier = Modifier.fillMaxWidth(), label = { Text("Limitmeldung") }, minLines = 2, maxLines = 5
                 )
                 Detail("Falls der Dienst im Text fehlt, wähle ihn hier. Zeiten ohne Offset gelten in ${zone.id}.")
                 ProviderChoices(provider) { provider = if (provider == it) null else it }
-                if (parsed.isEmpty()) {
+                if (undated != null) {
+                    Text("Erkannte Uhrzeit ${undated.time} · ${undated.zone.id}")
+                    TextButton(onClick = { onCompleteDate(undated) }) { Text("Datum ergänzen") }
+                } else if (parsed.isEmpty()) {
                     Text("Keine eindeutige zukünftige Rücksetzzeit erkannt.")
                     Detail("Beispiel · Codex | wöchentlich | JJJJ-MM-TTThh:mm+02:00")
                 } else {
                     Text("Erkannte Rücksetzzeiten", style = MaterialTheme.typography.titleSmall)
                     parsed.forEach {
-                        Detail("${it.provider.title} · ${it.window.title}\n${displayTime(it.resetAt, zone)}")
+                        val label = listOf(it.provider.title, it.window.title, it.scope)
+                            .filter(String::isNotBlank).joinToString(" · ")
+                        Detail("$label\n${displayTime(it.resetAt, zone)}")
                     }
                 }
             }
@@ -356,7 +442,12 @@ private fun ImportDialog(initial: String, zone: ZoneId, onClose: () -> Unit, onS
     )
 }
 
-private data class ManualEntry(val provider: Provider = Provider.CHATGPT, val window: LimitWindow = LimitWindow.SHORT)
+private data class ManualEntry(
+    val provider: Provider = Provider.CHATGPT,
+    val window: LimitWindow = LimitWindow.SHORT,
+    val existing: LimitRecord? = null,
+    val undated: UndatedReset? = null
+)
 private val inputFormatter = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm")
 private val outputFormatter = DateTimeFormatter.ofPattern("dd.MM.uuuu, HH:mm z", Locale.GERMANY)
 
@@ -366,41 +457,62 @@ private fun displayTime(time: Instant, zone: ZoneId) = outputFormatter.format(ti
 private fun ManualDialog(initial: ManualEntry, zone: ZoneId, onClose: () -> Unit, onSave: (ResetCandidate) -> Unit) {
     var provider by remember { mutableStateOf(initial.provider) }
     var window by remember { mutableStateOf(initial.window) }
-    var text by remember { mutableStateOf("") }
+    val entryZone = initial.undated?.zone ?: zone
+    var text by remember { mutableStateOf(initial.existing?.resetAt?.atOffset(
+        entryZone.rules.getOffset(initial.existing.resetAt)
+    )?.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME).orEmpty()) }
+    var scope by remember { mutableStateOf(initial.existing?.scope ?: initial.undated?.scope.orEmpty()) }
     val context = LocalContext.current
-    val parsed = remember(text, zone) { ResetParser.parseManual(text, zone) }
-    val valid = parsed?.takeIf { ResetParser.isFuture(it, Instant.now()) }
+    val parsed = remember(text, entryZone) { ResetParser.parseManual(text, entryZone) }
+    val valid = parsed?.takeIf { ResetParser.isFuture(it, Instant.now()) && ResetParser.validScope(scope) }
     AlertDialog(
         onDismissRequest = onClose,
         title = { Text("Rücksetzzeit eintragen") },
         text = {
             Column(Modifier.imePadding().verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                ProviderChoices(provider) { provider = it }
-                for (option in LimitWindow.entries) {
-                    FilterChip(selected = window == option, onClick = { window = option }, label = { Text(option.title) })
+                if (initial.existing == null) {
+                    ProviderChoices(provider) { provider = it }
+                    for (option in LimitWindow.entries) {
+                        FilterChip(selected = window == option, onClick = { window = option }, label = { Text(option.title) })
+                    }
+                    OutlinedTextField(
+                        value = scope, onValueChange = { scope = it.take(ResetParser.MAX_SCOPE_LENGTH) },
+                        modifier = Modifier.fillMaxWidth(), label = { Text("Kontingentname (optional)") },
+                        singleLine = true, isError = !ResetParser.validScope(scope)
+                    )
+                } else {
+                    Detail(listOf(provider.title, window.title, scope).filter(String::isNotBlank).joinToString(" · "))
                 }
+                initial.undated?.let { if (text.isBlank()) Detail("Erkannte Uhrzeit ${it.time} · ${entryZone.id}") }
                 OutlinedTextField(
                     value = text, onValueChange = { text = it.take(64) },
                     modifier = Modifier.fillMaxWidth(), label = { Text("JJJJ-MM-TT HH:mm") }, singleLine = true,
                     isError = text.isNotBlank() && valid == null
                 )
                 TextButton(onClick = {
-                    val start = parsed?.atZone(zone)?.toLocalDateTime() ?: LocalDateTime.now(zone).plusHours(1)
+                    val start = parsed?.atZone(entryZone)?.toLocalDateTime()
+                        ?: LocalDateTime.now(entryZone).plusHours(1)
+                    val draftTime = initial.undated?.time?.takeIf { text.isBlank() }
                     DatePickerDialog(context, { _, year, month, day ->
-                        TimePickerDialog(context, { _, hour, minute ->
-                            text = inputFormatter.format(LocalDateTime.of(year, month + 1, day, hour, minute))
-                        }, start.hour, start.minute, true).show()
+                        if (draftTime != null) {
+                            text = inputFormatter.format(java.time.LocalDate.of(year, month + 1, day).atTime(draftTime))
+                        } else {
+                            TimePickerDialog(context, { _, hour, minute ->
+                                text = inputFormatter.format(LocalDateTime.of(year, month + 1, day, hour, minute))
+                            }, start.hour, start.minute, true).show()
+                        }
                     }, start.year, start.monthValue - 1, start.dayOfMonth).show()
-                }) { Text("Datum und Uhrzeit wählen") }
-                Detail("Zeitzone ${zone.id}. ISO-Zeit mit Offset möglich. Wähle einen eindeutigen Zeitpunkt in den nächsten 30 Tagen.")
+                }) { Text(if (initial.undated != null && text.isBlank()) "Datum wählen" else "Datum und Uhrzeit wählen") }
+                Detail("Zeitzone ${entryZone.id}. ISO-Zeit mit Offset möglich. Wähle einen eindeutigen Zeitpunkt in den nächsten 30 Tagen.")
                 if (valid != null) Detail(displayTime(valid, zone))
             }
         },
         confirmButton = {
             TextButton(enabled = valid != null, onClick = {
                 if (valid != null && ResetParser.isFuture(valid, Instant.now())) {
-                    onSave(ResetCandidate(provider, window, valid))
+                    onSave(ResetCandidate(provider, window, valid,
+                        initial.undated?.reached ?: initial.existing?.reached ?: false, scope.trim()))
                 }
             }) { Text("Speichern") }
         },
