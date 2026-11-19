@@ -5,7 +5,7 @@ Native Android-App für ChatGPT, Codex, Claude und Claude Code. Sie speichert be
 ## Auf Android installieren
 
 1. Öffne die [GitHub Releases](https://github.com/posista/ai_track/releases) auf deinem Smartphone und melde dich bei GitHub an, falls das Repository privat ist.
-2. Lade unter **Assets** die Datei `AI-Limit-Notifier.apk` oder für eine Vorschau `AI-Limit-Notifier-debug.apk` herunter. Öffne die APK in den Downloads. Android kann dich auffordern, deinem Browser oder Dateimanager **Apps aus dieser Quelle installieren** zu erlauben.
+2. Nutze in der [aktuellen Vorschau](https://github.com/posista/ai_track/releases/tag/preview-1.0.0) den Link **APK für Android herunterladen**. Bei einem automatischen Release findest du die Datei `AI-Limit-Notifier.apk` oder `AI-Limit-Notifier-debug.apk` unter **Assets**. Öffne die APK in den Downloads. Android kann dich auffordern, deinem Browser oder Dateimanager **Apps aus dieser Quelle installieren** zu erlauben.
 3. Öffne **AI Limit Notifier** und erlaube **Reset-Erinnerungen**. Für die automatische Erkennung öffne **Lesezugriff einrichten** und aktiviere **AI Limit Notifier · Limitmeldungen**. Bei seitlich installierten Apps kann Android den Zugriff zunächst als eingeschränkte Einstellung behandeln. Android erläutert die Freigabe in seiner [Hilfe zu eingeschränkten Einstellungen](https://support.google.com/android/answer/12623953?hl=de).
 4. Ohne verwertbare Limitmeldung kannst du eine Anbieteranzeige über **Teilen → AI Limit Notifier** oder **Text übernehmen** importieren. Prüfe vor dem Speichern die angezeigte Rücksetzzeit. Bei Bedarf wähle **Zeit eintragen** und übernimm das Datum aus der Anbieteranzeige.
 
