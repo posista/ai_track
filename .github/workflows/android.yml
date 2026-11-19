@@ -117,9 +117,13 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s  %s\n' "$APK_SHA256" "$APK" | sha256sum --check
-          if gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -Fxq "$APK"; then
-            echo "Der Release enthält bereits die APK."
-            exit 0
+          existing=false
+          if gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' > existing-assets.txt; then
+            existing=true
+            if grep -Fxq "$APK" existing-assets.txt; then
+              echo "Der Release enthält bereits die APK."
+              exit 0
+            fi
           fi
           if [[ "$APK" == AI-Limit-Notifier-debug.apk ]]; then
             printf '%s\n' 'Installierbare Vorschau für Android 8.0 oder neuer. Zum Testen den APK-Download unten öffnen. Der Debug-Schlüssel eines späteren Builds kann abweichen.' > release-notes.md
@@ -129,7 +133,11 @@ jobs:
             release_args=()
           fi
           printf '\nSHA-256 der APK: `%s`\n' "$APK_SHA256" >> release-notes.md
-          gh release create "$GITHUB_REF_NAME" "$APK" --verify-tag \
-            --title "AI Limit Notifier $GITHUB_REF_NAME" --notes-file release-notes.md "${release_args[@]}"
+          if [[ "$existing" == true ]]; then
+            gh release upload "$GITHUB_REF_NAME" "$APK"
+          else
+            gh release create "$GITHUB_REF_NAME" "$APK" --verify-tag \
+              --title "AI Limit Notifier $GITHUB_REF_NAME" --notes-file release-notes.md "${release_args[@]}"
+          fi
           gh release download "$GITHUB_REF_NAME" --pattern "$APK" --dir "$RUNNER_TEMP/released"
           (cd "$RUNNER_TEMP/released" && printf '%s  %s\n' "$APK_SHA256" "$APK" | sha256sum --check)
