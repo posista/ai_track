@@ -1,0 +1,107 @@
+name: Android
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      apk: ${{ steps.apk.outputs.file }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/wrapper-validation@v4
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Desktop-Export prüfen
+        run: python3 -m unittest discover -s tools
+      - name: Lint, Unit-Tests und Debug-Build
+        run: ./gradlew --no-daemon lintDebug testDebugUnitTest assembleDebug
+      - name: APK erzeugen und Signatur prüfen
+        id: apk
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEYSTORE_BASE64 || '' }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
+          ANDROID_KEY_ALIAS: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEY_ALIAS || '' }}
+          ANDROID_KEY_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEY_PASSWORD || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          file=AI-Limit-Notifier-debug.apk
+          count=0
+          for var in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -n "${!var}" ]]; then
+              count=$((count + 1))
+            fi
+          done
+          if [[ "$count" == 4 ]]; then
+            umask 077
+            export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/android-signing.jks"
+            trap 'rm -f "$ANDROID_KEYSTORE_PATH"' EXIT
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+            unset ANDROID_KEYSTORE_BASE64
+            ./gradlew --no-daemon assembleRelease
+            file=AI-Limit-Notifier.apk
+            cp app/build/outputs/apk/release/app-release.apk "dist/$file"
+          elif [[ "$count" == 0 ]]; then
+            cp app/build/outputs/apk/debug/app-debug.apk "dist/$file"
+          else
+            echo "::error::Release-Signierung benötigt alle vier Android-Secrets."
+            exit 1
+          fi
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "dist/$file"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-qa-reports
+          path: |
+            app/build/reports/lint-results-debug.html
+            app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: ignore
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+      - name: GitHub Release veröffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          APK: ${{ needs.build.outputs.apk }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$APK" == AI-Limit-Notifier-debug.apk ]]; then
+            printf '%s\n' 'Installierbare Vorschau für Android 8.0 oder neuer. Zum Testen den APK-Download unten öffnen. Der Debug-Schlüssel eines späteren Builds kann abweichen.' > release-notes.md
+            release_args=(--prerelease)
+          else
+            printf '%s\n' 'Signierte APK für Android 8.0 oder neuer. Zur Installation den APK-Download unten öffnen.' > release-notes.md
+            release_args=()
+          fi
+          gh release create "$GITHUB_REF_NAME" "$APK" --verify-tag \
+            --title "AI Limit Notifier $GITHUB_REF_NAME" --notes-file release-notes.md "${release_args[@]}"

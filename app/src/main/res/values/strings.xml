@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">AI Limit Notifier</string>
+    <string name="listener_name">AI Limit Notifier · Limitmeldungen</string>
+    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:colorAccent">#245D55</item>
+    </style>
+</resources>
