@@ -5,7 +5,7 @@ Native Android-App für ChatGPT, Codex, Claude und Claude Code. Sie speichert be
 ## Auf Android installieren
 
 1. Öffne die [GitHub Releases](https://github.com/posista/ai_track/releases) auf deinem Smartphone und melde dich bei GitHub an, falls das Repository privat ist.
-2. Nutze in der [aktuellen Vorschau](https://github.com/posista/ai_track/releases/tag/v1.2.0-preview.1) den Link **APK für Android herunterladen**. Bei einem automatischen Release findest du die Datei `AI-Limit-Notifier.apk` oder `AI-Limit-Notifier-debug.apk` unter **Assets**. Öffne die APK in den Downloads. Android kann dich auffordern, deinem Browser oder Dateimanager **Apps aus dieser Quelle installieren** zu erlauben.
+2. Nutze in der [aktuellen Vorschau](https://github.com/posista/ai_track/releases/tag/v1.2.0-preview.2) den Link **APK für Android herunterladen**. Bei einem automatischen Release findest du die Datei `AI-Limit-Notifier.apk` oder `AI-Limit-Notifier-debug.apk` unter **Assets**. Öffne die APK in den Downloads. Android kann dich auffordern, deinem Browser oder Dateimanager **Apps aus dieser Quelle installieren** zu erlauben.
 3. Öffne **AI Limit Notifier** und erlaube **Reset-Erinnerungen**. Für die automatische Erkennung öffne **Lesezugriff einrichten** und aktiviere **AI Limit Notifier · Limitmeldungen**. Bei seitlich installierten Apps kann Android den Zugriff zunächst als eingeschränkte Einstellung behandeln. Android erläutert die Freigabe in seiner [Hilfe zu eingeschränkten Einstellungen](https://support.google.com/android/answer/12623953?hl=de).
 4. Sende über **Test-Erinnerung senden** eine lokale Testmeldung. Über **Teilen → AI Limit Notifier**, **Text übernehmen** oder **Datei öffnen** kannst du Zeiten aus Anbieteranzeigen und Desktop-Exporten importieren. Bei einer einzelnen Meldung mit Uhrzeit ohne Datum kannst du das Datum ergänzen.
 
@@ -42,7 +42,7 @@ Mit JDK 21 und Android SDK 35 inklusive Build-Tools 35.0.0:
 python3 -m unittest discover -s tools
 ```
 
-GitHub Actions prüft Wrapper, Desktop-Export und Android-Quellcode, führt die Tests aus und stellt die signierte APK als Artefakt bereit. Ein Tag wie `v1.2.0` veröffentlicht die dauerhaft signierte APK. Ein Tag wie `v1.2.0-preview.1` veröffentlicht eine Debug-Vorschau. Der Tag muss zur APK-Version passen. Der Workflow prüft Signatur und SHA-256 vor der Veröffentlichung und lädt das Asset zur Kontrolle erneut herunter. Wenn GitHub den Runner-Start blockiert, erscheint kein Actions-Artefakt. Die veröffentlichte Vorschau kann in diesem Fall einen APK-Link im Release-Text verwenden.
+GitHub Actions prüft Wrapper, Desktop-Export und Android-Quellcode, führt die Tests aus und stellt die signierte APK als Artefakt bereit. Ein Tag wie `v1.2.0` veröffentlicht die dauerhaft signierte APK. Ein Tag wie `v1.2.0-preview.2` veröffentlicht eine Debug-Vorschau. Der Tag muss zur APK-Version passen. Der Workflow prüft Signatur und SHA-256 vor der Veröffentlichung und lädt das Asset zur Kontrolle erneut herunter. Wenn GitHub den Runner-Start blockiert, erscheint kein Actions-Artefakt. Die veröffentlichte Vorschau kann in diesem Fall einen APK-Link im Release-Text verwenden.
 
 Vor einem stabilen Release prüfe auf einem Smartphone:
 
