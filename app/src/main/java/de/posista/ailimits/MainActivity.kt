@@ -3,7 +3,9 @@ package de.posista.ailimits
 import android.Manifest
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
+import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -30,6 +32,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -54,8 +57,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.IntentCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -86,6 +92,7 @@ private val dark = darkColorScheme(
 class MainActivity : ComponentActivity() {
     private val app get() = application as LimitApplication
     private var sharedText by mutableStateOf<String?>(null)
+    private var sharedImage by mutableStateOf<Uri?>(null)
     private var listenerEnabled by mutableStateOf(false)
     private var notificationsEnabled by mutableStateOf(false)
     private var zone by mutableStateOf(ZoneId.systemDefault())
@@ -102,8 +109,9 @@ class MainActivity : ComponentActivity() {
             val colors = if (androidx.compose.foundation.isSystemInDarkTheme()) dark else light
             MaterialTheme(colorScheme = colors) {
                 Dashboard(
-                    app, zone, listenerEnabled, notificationsEnabled, sharedText,
+                    app, zone, listenerEnabled, notificationsEnabled, sharedText, sharedImage,
                     onShareHandled = { sharedText = null },
+                    onImageHandled = { sharedImage = null },
                     onEnableListener = {
                         startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                     },
@@ -147,6 +155,10 @@ class MainActivity : ComponentActivity() {
             sharedText = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)
                 ?.take(ResetParser.MAX_INPUT)?.toString() ?: ""
             intent.removeExtra(Intent.EXTRA_TEXT)
+        } else if (intent.action == Intent.ACTION_SEND && intent.type?.startsWith("image/") == true) {
+            sharedImage = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+                ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+            intent.removeExtra(Intent.EXTRA_STREAM)
         }
     }
 }
@@ -158,7 +170,9 @@ private fun Dashboard(
     listenerEnabled: Boolean,
     notificationsEnabled: Boolean,
     sharedText: String?,
+    sharedImage: Uri?,
     onShareHandled: () -> Unit,
+    onImageHandled: () -> Unit,
     onEnableListener: () -> Unit,
     onEnableReminders: () -> Unit
 ) {
@@ -170,7 +184,50 @@ private fun Dashboard(
     var manual by remember { mutableStateOf<ManualEntry?>(null) }
     var delete by remember { mutableStateOf<LimitRecord?>(null) }
     var feedback by remember { mutableStateOf<String?>(null) }
-    val resolver = LocalContext.current.contentResolver
+    val context = LocalContext.current
+    val resolver = context.contentResolver
+    var screenshot by remember { mutableStateOf<ScannedScreenshot?>(null) }
+    var scanJob by remember { mutableStateOf<Job?>(null) }
+    fun scanImage(uri: Uri) {
+        scanJob?.cancel()
+        screenshot = null
+        feedback = "Bildschirmfoto wird auf dem Gerät gelesen …"
+        scanJob = scope.launch {
+            val receivedAt = Instant.now()
+            try {
+                val text = readScreenshot(resolver, uri)
+                if (text.isBlank()) {
+                    feedback = "Im Bildschirmfoto wurde kein Text erkannt."
+                } else {
+                    screenshot = ScannedScreenshot(text, receivedAt)
+                    manual = null
+                    delete = null
+                    importText = null
+                    feedback = null
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                feedback = "Das Bildschirmfoto konnte nicht gelesen werden."
+            }
+        }
+    }
+    fun openProvider(site: String) {
+        try {
+            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(site)))
+        } catch (_: ActivityNotFoundException) {
+            feedback = "Android hat keine App zum Öffnen der Nutzungsansicht gefunden."
+        }
+    }
+    val selectScreenshot = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) scanImage(uri)
+    }
+    LaunchedEffect(sharedImage) {
+        if (sharedImage != null) {
+            scanImage(sharedImage)
+            onImageHandled()
+        }
+    }
     val importFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) scope.launch {
             try {
@@ -254,6 +311,20 @@ private fun Dashboard(
                     ) { Text("Zeiten exportieren") }
                 }
                 feedback?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+                Card {
+                    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Nutzung scannen", style = MaterialTheme.typography.titleMedium)
+                        Text("Öffne beim Anbieter die Einstellungen für Nutzung und teile oder öffne ein Bildschirmfoto.",
+                            style = MaterialTheme.typography.bodyMedium)
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            TextButton(onClick = { openProvider("https://chatgpt.com/") }) { Text("ChatGPT öffnen") }
+                            TextButton(onClick = { openProvider("https://claude.ai/settings/usage") }) { Text("Claude öffnen") }
+                        }
+                        OutlinedButton(onClick = { selectScreenshot.launch(arrayOf("image/*")) }) {
+                            Text("Bildschirmfoto lesen")
+                        }
+                    }
+                }
                 Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
                     Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text("Android-Benachrichtigungen", style = MaterialTheme.typography.titleMedium)
@@ -291,6 +362,15 @@ private fun Dashboard(
                 }
             }
         }
+    }
+    screenshot?.let { scan ->
+        UsageScanDialog(scan, zone, onClose = { screenshot = null }, onSave = { candidates ->
+            scope.launch {
+                val count = app.save(candidates, Source.SCREENSHOT, Instant.now())
+                feedback = "$count Rücksetzzeiten aus dem Bildschirmfoto übernommen."
+                screenshot = null
+            }
+        })
     }
     importText?.let { text ->
         ImportDialog(text, zone, onClose = { importText = null }, onCompleteDate = { draft ->
@@ -391,6 +471,59 @@ private fun ProviderCard(
 @Composable
 private fun Detail(text: String) {
     Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+private data class ScannedScreenshot(val text: String, val receivedAt: Instant)
+
+@Composable
+private fun UsageScanDialog(
+    scan: ScannedScreenshot,
+    zone: ZoneId,
+    onClose: () -> Unit,
+    onSave: (List<ResetCandidate>) -> Unit
+) {
+    var provider by remember(scan) { mutableStateOf<Provider?>(null) }
+    var fresh by remember(scan) { mutableStateOf(false) }
+    val candidates = remember(scan, provider, fresh, zone) {
+        provider?.let {
+            UsageScan.read(scan.text, it, Instant.now(), zone, scan.receivedAt.takeIf { fresh })
+        }.orEmpty()
+    }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Rücksetzzeiten aus dem Bildschirmfoto") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Anbieter auswählen")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for (option in listOf(Provider.CHATGPT, Provider.CLAUDE)) {
+                        FilterChip(selected = provider == option, onClick = { provider = option },
+                            label = { Text(option.title) })
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = fresh, onCheckedChange = { fresh = it })
+                    Text("Bildschirmfoto gerade aufgenommen")
+                }
+                Detail("Relative Zeiten und Wochentage werden nur mit dieser Bestätigung berechnet. Fehlt im Bild die Zeitzone, gilt ${zone.id}.")
+                if (provider != null && candidates.isEmpty()) {
+                    Text("Keine eindeutige zukünftige Rücksetzzeit erkannt.")
+                }
+                for (candidate in candidates) {
+                    val label = listOf(candidate.provider.title, candidate.window.title, candidate.scope)
+                        .filter(String::isNotBlank).joinToString(" · ")
+                    Detail("$label\n${displayTime(candidate.resetAt, zone)}")
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = candidates.isNotEmpty(), onClick = {
+                val future = candidates.filter { ResetParser.isFuture(it.resetAt, Instant.now()) }
+                if (future.isNotEmpty()) onSave(future) else onClose()
+            }) { Text("Übernehmen") }
+        },
+        dismissButton = { TextButton(onClick = onClose) { Text("Abbrechen") } }
+    )
 }
 
 @Composable

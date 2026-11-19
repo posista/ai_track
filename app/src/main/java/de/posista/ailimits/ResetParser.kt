@@ -33,7 +33,8 @@ enum class LimitWindow(val title: String) {
 enum class Source(val title: String, val confidence: String) {
     NOTIFICATION("Android-Mitteilung des Anbieters", "Mittel · automatisch erkannt"),
     SHARED("Übernommener Text oder Datei", "Mittel · von dir geprüft"),
-    MANUAL("Manuelle Eingabe", "Abhängig von deiner Eingabe")
+    MANUAL("Manuelle Eingabe", "Abhängig von deiner Eingabe"),
+    SCREENSHOT("Bildschirmfoto", "Mittel · von dir geprüft")
 }
 
 data class ResetCandidate(
@@ -82,7 +83,8 @@ object ResetParser {
     private val modelScope = Regex("""\b(?:fable|opus|sonnet|haiku)\b""")
     private val allModels = Regex("""\b(?:all models|alle modelle)\b""")
     private val dateTime = Regex(
-        """^(?:(\d{4}-\d\d-\d\d)[T ]|(\d\d\.\d\d\.\d{4}),?\s+(?:um\s+)?)(\d\d:\d\d(?::\d\d(?:\.\d{1,9})?)?)(?![\d:])"""
+        """^(?:(\d{4}-\d\d-\d\d)[T ]|(\d\d\.\d\d\.\d{4}),?\s+(?:um\s+)?)(\d{1,2}:\d\d(?::\d\d(?:\.\d{1,9})?)?)(?:\s*([ap]\.?m\.?)(?!\p{L}))?(?![\d:])""",
+        RegexOption.IGNORE_CASE
     )
     private val clockTime = Regex("""^(\d{1,2})(?::(\d\d))?(?:\s*(am|pm)\b)?(?![\d:.])""", RegexOption.IGNORE_CASE)
     private val zoneToken = Regex(
@@ -235,11 +237,18 @@ object ResetParser {
 
     private fun parseDated(input: String, fallback: ZoneId?): Instant? {
         val match = dateTime.find(input) ?: return null
-        val (_, isoDate, german, clock) = match.groupValues
+        val (_, isoDate, german, clock, period) = match.groupValues
         val zone = resolveZone(input.substring(match.range.last + 1), fallback) ?: return null
         return runCatching {
             val date = if (isoDate.isEmpty()) LocalDate.parse(german, germanDate) else LocalDate.parse(isoDate)
-            resolveLocal(date.atTime(LocalTime.parse(clock)), zone)
+            val paddedClock = if (clock.indexOf(':') == 1) "0$clock" else clock
+            val time = LocalTime.parse(paddedClock)
+            val normalizedTime = if (period.isEmpty()) time else {
+                if (time.hour !in 1..12) return null
+                val hour = time.hour % 12 + if (period.startsWith('p', ignoreCase = true)) 12 else 0
+                time.withHour(hour)
+            }
+            resolveLocal(date.atTime(normalizedTime), zone)
         }.getOrNull()
     }
 
