@@ -64,7 +64,7 @@ jobs:
           fi
           if [[ "$stable" == true ]]; then
             for var in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
-              if [[ -z "${!var}" ]]; then
+              if [[ -z "${!var:-}" ]]; then
                 echo "::error::Stabile Releases benötigen alle vier Android-Secrets. Verwende einen Vorschautag für eine Debug-APK."
                 exit 1
               fi
