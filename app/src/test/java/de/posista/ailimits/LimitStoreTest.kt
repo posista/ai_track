@@ -45,14 +45,20 @@ class LimitStoreTest {
         val context = RuntimeEnvironment.getApplication()
         val name = "limit-persistence-test.db"
         try {
-            Room.databaseBuilder(context, LimitDatabase::class.java, name).build().use { first ->
+            val first = Room.databaseBuilder(context, LimitDatabase::class.java, name).build()
+            try {
                 LimitStore(first).ingest(listOf(session), Source.SHARED, now)
+            } finally {
+                first.close()
             }
-            Room.databaseBuilder(context, LimitDatabase::class.java, name).build().use { reopened ->
+            val reopened = Room.databaseBuilder(context, LimitDatabase::class.java, name).build()
+            try {
                 val saved = reopened.limits().pending().single()
                 assertEquals(session.resetAt, saved.resetAt)
                 assertEquals(now, saved.observedAt)
                 assertEquals(Source.SHARED, saved.source)
+            } finally {
+                reopened.close()
             }
         } finally {
             context.deleteDatabase(name)

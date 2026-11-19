@@ -50,6 +50,18 @@ class ResetParserTest {
             ResetParser.readShared("Usage limit resets at 2026-03-27 15:00", Provider.CLAUDE, now, berlin).single())
     }
 
+    @Test fun acceptsFullGermanDateWithExplicitIanaZone() {
+        val result = ResetParser.readNotification(
+            "Wöchentliches Nutzungslimit erreicht. Wieder ab 29.03.2026, 03:30 (Europe/Berlin)",
+            Provider.CLAUDE, now, now
+        )
+        assertEquals(Instant.parse("2026-03-29T01:30:00Z"), result?.resetAt)
+        assertEquals(LimitWindow.WEEKLY, result?.window)
+        assertNull(ResetParser.readNotification(
+            "Limit resets at 2026-03-29 03:30 (PST)", Provider.CLAUDE, now, now
+        ))
+    }
+
     @Test fun rejectsPlainClockTimesRelativeSharesAndUnrelatedMessages() {
         assertTrue(ResetParser.readShared("Claude weekly limit resets in 2 hours", null, now, berlin).isEmpty())
         assertTrue(ResetParser.readShared("Claude limit resets at 4:30pm", null, now, berlin).isEmpty())

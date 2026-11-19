@@ -58,7 +58,9 @@ object ResetParser {
     private val offsetTimestamp = Regex(
         """\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d(?:\.\d{1,9})?)?(?:Z|[+-]\d\d:\d\d)(?![\w:+-])"""
     )
-    private val localTimestamp = Regex("""\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?![\w:+-])""")
+    private val localTimestamp = Regex(
+        """^(?:(\d{4}-\d\d-\d\d)[T ]|(\d\d\.\d\d\.\d{4}),?\s+)(\d\d:\d\d)(?![\w:+-]|\s*[+-]\d)(?:\s*\(([^)]+)\))?"""
+    )
     private val relative = Regex(
         """(?i)^\s*(?:(\d{1,3})\s*(?:hours?|hrs?|h|stunden?|std\.?)(?![\p{L}\d]))?\s*(?:and\s+|und\s+)?(?:(\d{1,3})\s*(?:minutes?|mins?|m|minuten?)(?![\p{L}\d]))?"""
     )
@@ -139,8 +141,14 @@ object ResetParser {
         val timeText = message.substring(marker.range.last + 1).trimStart()
         val exact = offsetTimestamp.find(timeText)?.takeIf { it.range.first == 0 }
             ?.let { parseOffset(it.value) }
-        val local = if (zone != null) localTimestamp.find(timeText)?.takeIf { it.range.first == 0 }
-            ?.let { parseManual(it.value.replace('T', ' '), zone) } else null
+        val local = localTimestamp.find(timeText)?.let { timestamp ->
+            val (_, isoDay, germanDay, clock, zoneId) = timestamp.groupValues
+            val date = isoDay.ifEmpty { germanDay.split('.').asReversed().joinToString("-") }
+            val explicitZone = zoneId.takeIf { '/' in it || it == "UTC" }
+                ?.let { runCatching { ZoneId.of(it) }.getOrNull() }
+            val resolvedZone = if (zoneId.isEmpty()) zone else explicitZone
+            resolvedZone?.let { parseManual("$date $clock", it) }
+        }
         val until = exact ?: local ?: if (postedAt != null && postedAt <= now &&
             marker.value.endsWith(" in", ignoreCase = true)
         ) parseRelative(timeText, postedAt) else null
